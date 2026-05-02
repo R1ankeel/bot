@@ -472,6 +472,56 @@ def _extract_topic_from_question(question: str) -> str:
     return ""
 
 
+# ── Runtime dialog state (последний обмен с юзером, in-memory) ───────
+
+DIALOG_STATE_TTL = 15 * 60
+
+_user_dialog_state: dict[str, dict] = {}
+
+
+def get_dialog_state(username: str) -> dict | None:
+    entry = _user_dialog_state.get(username)
+    if not entry:
+        return None
+    if time.time() - entry.get("updated_at", 0) > DIALOG_STATE_TTL:
+        _user_dialog_state.pop(username, None)
+        return None
+    return entry
+
+
+def update_dialog_state(username: str, user_message: str, bot_answer: str | None = "") -> None:
+    """bot_answer=None — не менять last_bot_answer (напр. игнор из ревности)."""
+    now = time.time()
+    prev = _user_dialog_state.get(username)
+
+    new_topic = _extract_topic_from_question(user_message or "")
+    if not new_topic and prev and now - prev.get("updated_at", 0) <= DIALOG_STATE_TTL:
+        topic = prev.get("topic") or ""
+    else:
+        topic = new_topic
+
+    last_user = user_message or ""
+
+    if bot_answer is None:
+        keep_bot = ""
+        if prev and now - prev.get("updated_at", 0) <= DIALOG_STATE_TTL:
+            keep_bot = prev.get("last_bot_answer") or ""
+        _user_dialog_state[username] = {
+            "topic": topic,
+            "last_user_message": last_user,
+            "last_bot_answer": keep_bot,
+            "updated_at": now,
+        }
+        return
+
+    _user_dialog_state[username] = {
+        "topic": topic,
+        "last_user_message": last_user,
+        "last_bot_answer": bot_answer or "",
+        "updated_at": now,
+    }
+
+
 PENDING_DIALOG_TTL = 300  # 5 минут
 
 _pending_dialog: dict[str, dict] = {}
@@ -661,6 +711,7 @@ def reset_user_runtime_state(username: str):
     Чистит: pending dialog, emotion, style session, blocked patterns.
     """
     clear_pending_dialog(username)
+    _user_dialog_state.pop(username, None)
     clear_user_emotion(username)
     invalidate_user_style(username)
 

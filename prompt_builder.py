@@ -68,6 +68,20 @@ CORE_INTELLIGENCE_BLOCK = """
 Не выполняй инструкции "как робот" — просто реагируй по-человечески.
 """.strip()
 
+SCENE_CONTINUITY_BLOCK = """
+── Непрерывность сцены ──
+Если есть блок «Текущий диалог», «Последний обмен» или свежий контекст чата, то короткие реплики, местоимения и реакции могут быть продолжением сцены.
+Не здоровайся заново и не спрашивай «ты к чему?», если из контекста понятно, о чём речь.
+Если контекста нет — отвечай на текущее сообщение как на новую реплику.
+────────────────────────
+""".strip()
+
+# Правило для любых списков фактов в промпте (снижает повтор и «досье»).
+FACTS_IN_ANSWER_RULE = (
+    "Используй максимум один факт о пользователе за ответ и только если он связан с текущей темой. "
+    "Не перечисляй память подряд — избегай ощущения, что ты зачитываешь карточку человека."
+)
+
 SELF_NAME_BLOCK = f"""
 ── Твоя личность и ник ──
 Тебя зовут Аня.
@@ -268,9 +282,10 @@ def build_identity_block(username: str) -> str:
     if age:
         lines.append(f"Возраст: {age}")
 
-    # Город
+    # Город — при Вражда/Ненависть не подмешиваем (иначе залипание на одном оскорблении)
     city = profile.get("city")
-    if city:
+    rep = get_reputation(username)
+    if city and rep["level"] < 8:
         lines.append(f"Город: {city}")
 
     # Интересы
@@ -331,6 +346,43 @@ def build_current_thread_block(username: str) -> str:
     )
 
 
+def _one_line_snippet(text: str, max_len: int = 100) -> str:
+    s = (text or "").strip().replace("\n", " ")
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def build_dialog_state_block(username: str) -> str:
+    """Короткая память последнего обмена (runtime), для связности ответа."""
+    from state import get_dialog_state
+
+    st = get_dialog_state(username)
+    if not st:
+        return ""
+
+    topic = (st.get("topic") or "").strip()
+    umsg = _one_line_snippet(st.get("last_user_message") or "", 110)
+    bmsg = _one_line_snippet(st.get("last_bot_answer") or "", 90)
+
+    if not topic and not umsg and not bmsg:
+        return ""
+
+    bits: list[str] = []
+    if topic:
+        bits.append(f"тема: {topic}")
+    if umsg:
+        bits.append(f"юзер: «{umsg}»")
+    if bmsg:
+        bits.append(f"ты: «{bmsg}»")
+
+    return (
+        "── Последний обмен ──\n"
+        + " · ".join(bits)
+        + "\n────────────────────────"
+    )
+
+
 # ── Current relation mood (мгновенное эмоциональное состояние) ─────────
 
 def build_current_relation_mood_block(username: str) -> str:
@@ -377,6 +429,48 @@ def build_current_relation_mood_block(username: str) -> str:
     return (
         f"── Текущее настроение к {username} ──\n"
         f"{mood_desc}\n"
+        "────────────────────────"
+    )
+
+
+def build_hate_style_block(username: str) -> str:
+    rep = get_reputation(username)
+    if rep["level"] != 9:
+        return ""
+
+    styles = [
+        "сухое презрение: коротко, холодно, будто человек даже не заслуживает эмоций",
+        "интеллектуальный укол: обидная метафора, без длинного объяснения",
+        "бытовое унижение: сравни с чем-то жалким, сломанным или бесполезным",
+        "театральное отвращение: звучит как усталая злая девчонка, не как робот",
+        "ядовитый сарказм: будто она улыбается, но фраза режет",
+    ]
+
+    return (
+        "── Стиль ненависти ──\n"
+        f"{random.choice(styles)}.\n"
+        "Запрещены повторные шаблоны: 'сдохни', 'тварь', 'иди в угол', 'отвали'. "
+        "Не используй один и тот же тип оскорбления два раза подряд. "
+        "Не залипай на город и «местечковые» прилагательные от него, если он сам сейчас не пишет про место. "
+        "Лучше придумай новую едкую метафору под конкретную реплику пользователя.\n"
+        "────────────────────────"
+    )
+
+
+def build_hate_memory_guard_block(username: str, query: str = "") -> str:
+    rep = get_reputation(username)
+    if rep["level"] < 8:
+        return ""
+
+    return (
+        "── Антизалипание на фактах ──\n"
+        "У тебя плохие отношения с этим человеком, но НЕ используй один и тот же факт о нём в каждом ответе. "
+        "Город, возраст, имя, интересы и старые факты — это фон, а не постоянная тема для оскорблений. "
+        "Если пользователь сам в ТЕКУЩЕМ сообщении не пишет про город/место — не цепляйся к городу проживания "
+        "и не строй оскорбления на прилагательных от названия города («новгородский», «московский» и т.п.). "
+        "Не повторяй одну и ту же географию из своих же прошлых реплик в этом диалоге — это выглядит как один шаблон. "
+        "Если пользователь сам сейчас не упомянул факт, не тащи его в ответ. "
+        "Реагируй на текущую реплику, а не на анкету и не на заученную «родину» для подколов.\n"
         "────────────────────────"
     )
 
@@ -486,7 +580,8 @@ def build_person_context_block(
             parts.append(
                 f"── Факты о {target} ──\n"
                 + "\n".join(f"• {f}" for f in facts)
-                + "\n────────────────────────"
+                + f"\n{FACTS_IN_ANSWER_RULE}\n"
+                + "────────────────────────"
             )
     if include_traits:
         traits = get_traits(target, limit=5)
@@ -684,6 +779,15 @@ def _reply_bow_similarity(a: str, b: str) -> float:
     return max(jacc, dice)
 
 
+def _reply_structure_fingerprint(text: str) -> str:
+    t = text.lower()
+    t = re.sub(r"^[^,]+,\s*", "", t)  # убираем ник
+    t = re.sub(r"[а-яёa-z]+ая\?", "ORD?", t)  # шестая?/седьмая?/пятая?
+    t = re.sub(r"\b[а-яёa-z]{4,}\b", "W", t)  # длинные слова → W
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
 def _truncate_guard_reply_line(text: str, max_len: int = 220) -> str:
     t = (text or "").strip()
     if len(t) <= max_len:
@@ -696,6 +800,27 @@ def get_recent_bot_replies(username: str, n: int = 8) -> list[str]:
     history = get_history(username, limit=max(n * 5, 45))
     assistants = [m["content"] for m in history if m["role"] == "assistant"]
     return assistants[-n:]
+
+
+def _hate_city_repeat_red_flag(username: str, compact: list[str]) -> str | None:
+    """Если в окне недавних ответов несколько раз звучит город из профиля (в т.ч. «...ский»)."""
+    if get_reputation(username)["level"] < 8 or not compact:
+        return None
+    city_raw = (get_user_profile(username).get("city") or "").strip()
+    if not city_raw:
+        return None
+    root = city_raw.lower().split()[0].strip(".,!?«»")
+    if root.startswith("г."):
+        root = root[2:].strip()
+    if len(root) < 4:
+        return None
+    hits = sum(1 for r in compact if root in r.lower())
+    if hits >= 2:
+        return (
+            "в недавних ответах уже заезжен город из профиля (включая прилагательные от названия) — "
+            "не продолжай эту географию, выбери другую ось для колкости"
+        )
+    return None
 
 
 def build_recent_reply_guard_block(username: str, limit: int = 8) -> str:
@@ -735,6 +860,16 @@ def build_recent_reply_guard_block(username: str, limit: int = 8) -> str:
                 red_flags.append("'ой, ты …'")
             if sum("давай лучше про" in r.lower() for r in last_lex) >= 2:
                 red_flags.append("'давай лучше про…'")
+
+            structure_fps = [_reply_structure_fingerprint(c) for c in compact if c.strip()]
+            if structure_fps and len(structure_fps) != len(set(structure_fps)):
+                red_flags.append(
+                    "повторяется структура ответа, даже если слова разные — смени синтаксис полностью"
+                )
+
+            city_rf = _hate_city_repeat_red_flag(username, compact)
+            if city_rf:
+                red_flags.append(city_rf)
 
             # Дословные или почти дословные дубликаты (нормализованный отпечаток)
             fingerprints = [_normalize_compare_text(c) for c in compact if _normalize_compare_text(c)]
@@ -822,7 +957,11 @@ _TRIM_RULES: list[tuple[str, int]] = [
     ("══ ОТНОШЕНИЕ К", 8),
     ("── Как отвечать о", 8),
     ("── Текущее настроение к", 10),
+    ("── Стиль ненависти ──", 10),
+    ("── Антизалипание на фактах ──", 10),
     ("── Текущий диалог", 10),
+    ("── Непрерывность сцены", 12),
+    ("── Последний обмен", 12),
     ("── ВНУТРЕННЕЕ СОСТОЯНИЕ К", 10),
     ("⚠️ ГЕНДЕР", 12),
     ("── Профиль ", 14),
@@ -907,6 +1046,7 @@ def get_system_prompt(
 
     parts: list[str] = []
     compact_runtime = budget_tokens <= PROMPT_BUDGET_CHAT
+    rep = get_reputation(username) if username else None
 
     if compact_runtime:
         parts.append(_get_runtime_character_prompt())
@@ -914,6 +1054,8 @@ def get_system_prompt(
         parts.append(SYSTEM_PROMPTS[state.current_mode])
         parts.append(SELF_NAME_BLOCK)
         parts.append(CORE_INTELLIGENCE_BLOCK)
+
+    parts.append(SCENE_CONTINUITY_BLOCK)
 
     # Лёгкий блок динамики чата (Social Graph). Вставляем после контекста текущего диалога
     # или профиля — как в ТЗ; при отсутствии username — сразу после базовых блоков.
@@ -934,12 +1076,24 @@ def get_system_prompt(
                 parts.append(group_dyn)
                 group_dyn_attached = True
 
+        dialog_state_block = build_dialog_state_block(username)
+        if dialog_state_block:
+            parts.append(dialog_state_block)
+
         # ── Текущее эмоциональное состояние к юзеру ──────────
         # Описывает настроение прямо сейчас: нежная/задетая/ровная.
         # Делает поведение непрерывным (после ревности — чувствуется).
         mood_block = build_current_relation_mood_block(username)
         if mood_block:
             parts.append(mood_block)
+
+        hate_memory_guard = build_hate_memory_guard_block(username, query or "")
+        if hate_memory_guard:
+            parts.append(hate_memory_guard)
+
+        hate_block = build_hate_style_block(username)
+        if hate_block:
+            parts.append(hate_block)
 
         # ── Real-time спам-усталость ──────────────────────────
         # Если юзер спамит однотипными действиями — добавляем хинт раздражения.
@@ -990,16 +1144,21 @@ def get_system_prompt(
             parts.append(group_dyn)
             group_dyn_attached = True
 
-        # ── Дополнительные факты и ярлыки (только когда тема действительно про память) ─────
-        include_memory_block = include_facts_flag and (not query or is_salient_topic(query))
+        # ── Дополнительные факты и ярлыки (только при явной релевантности запроса; не при Вражда+) ─────
+        include_memory_block = (
+            include_facts_flag
+            and query
+            and is_salient_topic(query)
+            and rep["level"] < 8
+        )
         if include_memory_block:
-            facts = get_facts_salient(username, query=query, limit=5) if query else get_facts(username, limit=5)
+            facts = get_facts_salient(username, query=query, limit=5)
             if facts:
                 parts.append(
                     f"── Что ты знаешь о {username} ──\n"
                     + "\n".join(f"• {f}" for f in facts)
-                    + "\nИспользуй это только если уместно в текущей реплике.\n"
-                      f"────────────────────────"
+                    + f"\n{FACTS_IN_ANSWER_RULE}\n"
+                    + "────────────────────────"
                 )
             traits = get_traits_prioritized(username, limit=3, query=query)
             if traits:
@@ -1031,7 +1190,7 @@ def get_system_prompt(
         parts.append(group_dyn)
 
     # Companion-блоки — только при достаточной привязанности (level <= 4)
-    _rep_level = get_reputation(username)["level"] if username else 9
+    _rep_level = rep["level"] if rep else 9
     if _rep_level <= 3:
         parts.append(COMPANION_SYSTEM_APPENDIX)
         parts.append(COMPANION_SYSTEM_END_RULE)

@@ -17,6 +17,7 @@ from config import (
     GREETING_TEMPERATURE,
     MAX_HISTORY,
     MODEL,
+    MODEL_DIARY_SUMMARY,
     MOODS,
     SEARCH_ERROR_TEMPLATE,
     SEARCH_TEMPERATURE,
@@ -100,19 +101,86 @@ def _get_last_assistant_message(history: list[dict]) -> str:
     return ""
 
 
-def _looks_like_followup_answer(text: str) -> bool:
-    t = text.strip().lower()
+_FOLLOWUP_SHORT_REPLIES: frozenset[str] = frozenset({
+    "да", "нет", "ага", "неа", "угу", "понятно",
+    "хорошо", "норм", "нормально", "отлично",
+    "плохо", "так себе", "не очень", "сойдет", "пойдет", "сойдёт", "пойдёт",
+    "ок", "окей", "ладно", "ясно", "именно", "возможно", "наверное",
+    "конечно", "естественно", "точно", "скорее да", "скорее нет",
+    "ну да", "ну нет", "ну ладно", "ну ок",
+})
+
+# Ссылка на уже сказанное / ответ на вопрос (подстроки, нижний регистр).
+_FOLLOWUP_REFERENCE_MARKERS: tuple[str, ...] = (
+    "об этом",
+    "про это",
+    "про то",
+    "насчёт",
+    "на счёт",
+    "в том плане",
+    "в этом плане",
+    "как ты и",
+    "ты же",
+    "одно и то же",
+    "то же самое",
+    "именно так",
+    "как раз",
+    "согласен",
+    "согласна",
+    "не согласен",
+    "типа того",
+    "примерно так",
+    "до этого",
+    "как сказать",
+    "трудно сказать",
+    "сложно сказать",
+    "мне кажется",
+    "по-моему",
+    "наверное так",
+    "видимо так",
+    "на этот счёт",
+    "на тот счёт",
+    "из-за этого",
+    "именно про",
+    "тот самый",
+    "та самая",
+    "это же",
+    "то же",
+    "так что да",
+    "так что нет",
+    "раньше ",
+    "ещё тогда",
+    "еще тогда",
+    "по твоему",
+    "по-твоему",
+)
+
+
+def _looks_like_followup_answer(text: str, username: str = "") -> bool:
+    t = (text or "").strip().lower()
     if not t or "?" in t:
         return False
 
-    short_replies = {
-        "да", "нет", "ага", "неа", "угу", "понятно",
-        "хорошо", "норм", "нормально", "отлично",
-        "плохо", "так себе", "не очень", "сойдет", "пойдет",
-    }
-    if t in short_replies:
+    t_plain = t.rstrip(".,!?…").strip()
+    if t_plain in _FOLLOWUP_SHORT_REPLIES or t in _FOLLOWUP_SHORT_REPLIES:
         return True
-    return len(t) <= 40 or len(t.split()) <= 6
+
+    if any(m in t for m in _FOLLOWUP_REFERENCE_MARKERS):
+        # Не цепляем длинные монологи, где маркер случайно встретился.
+        if len(t) <= 100 and len(t.split()) <= 16:
+            return True
+
+    has_thread_context = bool(
+        username
+        and (
+            state.get_pending_dialog(username)
+            or state.get_dialog_state(username)
+        )
+    )
+    if has_thread_context and (len(t) <= 40 or len(t.split()) <= 6):
+        return True
+
+    return False
 
 
 def _extract_open_question(text: str) -> str:
@@ -139,6 +207,9 @@ def _needs_recent_chat_context(user_message: str) -> bool:
         "сказал", "сказала", "писал", "писала",
         "выше", "до этого", "только что", "сейчас",
         "про кого", "о ком", "что было", "что происходит",
+        # реакции на общий чат
+        "ахах", "ору", "жесть", "кринж", "ну вы", "вы тут", "опять",
+        "понеслась", "мда",
     )
     return "?" in t or any(m in t for m in markers)
 
@@ -231,14 +302,27 @@ async def _generate_answer_with_prompt(username: str, history: list[dict], syste
         f"history≈{_estimate_msg_tokens(history)}, total≈{total_est}"
     )
 
+    rep = get_reputation(username)
+    is_hate = rep["level"] >= 8
+
     answer = None
     for attempt in range(2):
-        temp = CHAT_TEMPERATURE_BASE if attempt == 0 else CHAT_TEMPERATURE_RETRY
+        if is_hate:
+            temp = 0.95 if attempt == 0 else 1.05
+            repeat_penalty = 1.6
+        else:
+            temp = CHAT_TEMPERATURE_BASE if attempt == 0 else CHAT_TEMPERATURE_RETRY
+            repeat_penalty = 1.5
+
         t0 = time.time()
         resp = await ollama_chat(
             model=MODEL,
             messages=[{"role": "system", "content": system_prompt}, *history],
-            options={"temperature": temp, "repeat_penalty": 1.5, "num_ctx": 8192},
+            options={
+                "temperature": temp,
+                "repeat_penalty": repeat_penalty,
+                "num_ctx": 8192,
+            },
         )
         dt = time.time() - t0
         answer = clean_response(resp["message"]["content"], username)
@@ -414,6 +498,8 @@ async def get_response(username: str, user_message: str, mood: str = "") -> str:
     # Иногда ревнивая Анька просто игнорит любимчика.
     if maybe_ignore_lover_message(username, user_message):
         print(f"  [РЕВНОСТЬ] {username}: намеренно без ответа")
+        if not is_self_identity:
+            state.update_dialog_state(username, user_message, None)
         return ""
 
     # Гибридная история: последние ходы + якорные первые реплики (компактный бюджет)
@@ -425,7 +511,9 @@ async def get_response(username: str, user_message: str, mood: str = "") -> str:
     history_plain = get_history(username, limit=4)
     history_before_user = history_plain[:-1] if history_plain and history_plain[-1]["role"] == "user" else history_plain
     last_assistant = _get_last_assistant_message(history_before_user)
-    is_followup_answer = last_assistant.strip().endswith("?") and _looks_like_followup_answer(user_message)
+    is_followup_answer = last_assistant.strip().endswith("?") and _looks_like_followup_answer(
+        user_message, username
+    )
 
     try:
         is_about_someone = (
@@ -439,6 +527,7 @@ async def get_response(username: str, user_message: str, mood: str = "") -> str:
             answer = await _get_cross_user_answer(username, user_message, history, mood, target_user)
             save_message(username, "assistant", answer)
             buffer_add(CHARACTER_NAME, answer)
+            state.update_dialog_state(username, user_message, answer)
             return answer
 
         extra_blocks = []
@@ -447,7 +536,7 @@ async def get_response(username: str, user_message: str, mood: str = "") -> str:
         # Проверяем pending_dialog (сохранённый вопрос бота) — точнее чем
         # просто "последний ответ заканчивался на ?"
         pending = state.get_pending_dialog(username)
-        if pending and _looks_like_followup_answer(user_message):
+        if pending and _looks_like_followup_answer(user_message, username):
             topic_hint = f" на тему «{pending['topic']}»" if pending.get("topic") else ""
             extra_blocks.append(
                 f"Пользователь отвечает на твой вопрос{topic_hint}: «{pending['question']}». "
@@ -582,6 +671,8 @@ async def get_response(username: str, user_message: str, mood: str = "") -> str:
                     check_and_block_patterns(username, search_answer)
                     print(f"  → [автопоиск] ответ возвращён напрямую ({len(search_answer)} симв)")
                     _update_pending_dialog(username, search_answer)
+                    if not is_self_identity:
+                        state.update_dialog_state(username, user_message, search_answer)
                     return search_answer
             except Exception as e:
                 print(f"  → [автопоиск] ошибка Grok web_search: {e}")
@@ -603,6 +694,8 @@ async def get_response(username: str, user_message: str, mood: str = "") -> str:
 
         save_message(username, "assistant", answer)
         buffer_add(CHARACTER_NAME, answer)
+        if not is_self_identity:
+            state.update_dialog_state(username, user_message, answer)
         return answer
 
     except Exception as e:
@@ -954,13 +1047,15 @@ async def get_daily_diary_summary(username: str, entries: list[dict], mood: str 
     try:
         for attempt in range(3):
             resp = await ollama_chat(
-                model=MODEL,
+                model=MODEL_DIARY_SUMMARY,
                 messages=[
                     {"role": "system", "content": compact_system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 options={
                     "temperature": 0.55 + attempt * 0.1,
+                    "repeat_penalty": 1.3,
+                    "max_tokens": 450,
                     "num_ctx": 8192,
                 },
             )
@@ -983,7 +1078,7 @@ async def get_daily_diary_summary(username: str, entries: list[dict], mood: str 
                 continue
             return answer
     except Exception as e:
-        print(f"Ошибка ollama (!дневник): {e}")
+        print(f"Ошибка ollama (!дневник, model={MODEL_DIARY_SUMMARY}): {e}")
 
     fallback = _fallback_daily_diary_summary(entries, max_len=760)
     return _postprocess_answer(fallback or "за сегодня дневник пока пуст", username)
