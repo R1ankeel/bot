@@ -108,6 +108,8 @@ async def main():
         # Кулдаун команды !найдипару: не чаще 1 раза в час для каждого пользователя.
         find_pair_cooldown_seconds = 3600
         find_pair_last_used: dict[str, float] = {}
+        horoscope_cooldown_seconds = 3600
+        horoscope_last_used: dict[str, float] = {}
 
         current_mood   = random.choice(list(MOODS.keys()))
         last_mood_change = time.time()
@@ -425,6 +427,24 @@ async def main():
                             if text_lower.startswith("!гороскоп"):
                                 sign_raw = text[len("!гороскоп"):].strip()
                                 if sign_raw:
+                                    cooldown_key = username.lower().strip()
+                                    now_ts = time.time()
+                                    last_used = horoscope_last_used.get(cooldown_key, 0.0)
+                                    cooldown_left = horoscope_cooldown_seconds - (now_ts - last_used)
+
+                                    if cooldown_left > 0:
+                                        minutes_left = max(1, int((cooldown_left + 59) // 60))
+                                        print(f"[!гороскоп] от [{username}] на кулдауне: ещё {minutes_left} мин")
+                                        await state._reply_queue.put({
+                                            "type": "text",
+                                            "text": (
+                                                f"{username}, я уже делала тебе гороскоп недавно. "
+                                                f"Подожди ещё примерно {minutes_left} мин. 😏"
+                                            ),
+                                        })
+                                        continue
+
+                                    horoscope_last_used[cooldown_key] = now_ts
                                     print(f"[!гороскоп] от [{username}]: {sign_raw} → очередь")
                                     await state._reply_queue.put({
                                         "type": "horoscope",

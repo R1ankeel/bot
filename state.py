@@ -717,6 +717,7 @@ def reset_user_runtime_state(username: str):
 
     # Паттерн-блокировки
     _pattern_state.pop(username, None)
+    _hate_roast_recent.pop(username, None)
 
     # Карантин лексики
     _vocab_quarantine.pop(username, None)
@@ -804,6 +805,30 @@ def get_blocked_patterns(username: str) -> list[str]:
         if entry and now < entry.get("blocked_until", 0.0):
             result.append(desc)
     return result
+
+
+# ── Ротация стилей прожарки (уровень ненависти) ─────────────────────
+# Не даём подряд подставлять в промпт один и тот же hate-roast стиль.
+
+HATE_ROAST_STYLE_MEMORY = 6
+
+# {username: [style_label, ...]} — последние выбранные стили для промпта
+_hate_roast_recent: dict[str, list[str]] = {}
+
+
+def record_hate_roast_style(username: str, style: str) -> None:
+    if not style:
+        return
+    bucket = _hate_roast_recent.setdefault(username, [])
+    if bucket and bucket[-1] == style:
+        return
+    bucket.append(style)
+    if len(bucket) > HATE_ROAST_STYLE_MEMORY:
+        _hate_roast_recent[username] = bucket[-HATE_ROAST_STYLE_MEMORY:]
+
+
+def get_recent_hate_roast_styles(username: str) -> list[str]:
+    return list(_hate_roast_recent.get(username, []))
 
 
 # ── Карантин лексики (анти-эхо) ──────────────────────────────────────

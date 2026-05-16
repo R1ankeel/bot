@@ -304,12 +304,13 @@ async def _generate_answer_with_prompt(username: str, history: list[dict], syste
 
     rep = get_reputation(username)
     is_hate = rep["level"] >= 8
+    is_max_hate = rep["level"] == 9
 
     answer = None
     for attempt in range(2):
         if is_hate:
             temp = 0.95 if attempt == 0 else 1.05
-            repeat_penalty = 1.6
+            repeat_penalty = 1.75 if is_max_hate else 1.6
         else:
             temp = CHAT_TEMPERATURE_BASE if attempt == 0 else CHAT_TEMPERATURE_RETRY
             repeat_penalty = 1.5
@@ -904,7 +905,7 @@ async def get_find_pair_response(username: str, mood: str = "") -> str:
 
     try:
         resp = await ollama_chat(
-            model=MODEL,
+            model=MODEL_DIARY_SUMMARY,
             messages=[
                 {"role": "system", "content": get_system_prompt(username, budget_tokens=PROMPT_BUDGET_LIGHT)},
                 {"role": "user", "content": user_prompt},
@@ -983,7 +984,7 @@ async def get_horoscope_response(username: str, sign_raw: str, mood: str = "") -
 
     try:
         resp = await ollama_chat(
-            model=MODEL,
+            model=MODEL_DIARY_SUMMARY,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
